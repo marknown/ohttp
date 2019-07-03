@@ -2,13 +2,46 @@
 package ohttp
 
 import (
+	"context"
+	"crypto/tls"
+	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
+	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/rs/dnscache"
 )
+
+const (
+	httpsTemplate = `` +
+		`  DNS Lookup   TCP Connection   TLS Handshake   Server Processing   Content Transfer` + "\n" +
+		`[%s  |     %s  |    %s  |        %s  |       %s  ]` + "\n" +
+		`            |                |               |                   |                  |` + "\n" +
+		`   namelookup:%s      |               |                   |                  |` + "\n" +
+		`                       connect:%s     |                   |                  |` + "\n" +
+		`                                   pretransfer:%s         |                  |` + "\n" +
+		`                                                     starttransfer:%s        |` + "\n" +
+		`                                                                                total:%s` + "\n"
+
+	httpTemplate = `` +
+		`   DNS Lookup   TCP Connection   Server Processing   Content Transfer` + "\n" +
+		`[ %s  |     %s  |        %s  |       %s  ]` + "\n" +
+		`             |                |                   |                  |` + "\n" +
+		`    namelookup:%s      |                   |                  |` + "\n" +
+		`                        connect:%s         |                  |` + "\n" +
+		`                                      starttransfer:%s        |` + "\n" +
+		`                                                                 total:%s` + "\n"
+)
+
+// packageIsEnableDNSCache 是否启用dns缓存功能
+var packageIsEnableDNSCache = true
 
 // Request 请求
 type Request http.Request
@@ -18,6 +51,8 @@ type Response http.Response
 
 // RequestSettings 请求设置结构体
 type RequestSettings struct {
+	RawURL            string        // 请求地址
+	URL               *url.URL      // 请求URL结构体
 	Timeout           time.Duration // 请求超时时间
 	IsRandomUserAgent bool          // 是否随机UserAgent
 	UserAgent         string        // UserAgent 如果 IsRandomUserAgent 设置了，则随机
@@ -27,10 +62,13 @@ type RequestSettings struct {
 	ContentType       string        // 内容类型
 	Cookies           string        // Cookies 字符串
 	Headers           [][2]string   // 额外的请求头
+	TimeTrace         [8]time.Time  // 各阶段执行时间
 }
 
 // defaultSetting 默认设置
 var defaultSetting = RequestSettings{
+	RawURL:            "",
+	URL:               &url.URL{},
 	Timeout:           0 * time.Second,
 	IsRandomUserAgent: false,
 	UserAgent:         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.113 Safari/537.36",
@@ -40,6 +78,12 @@ var defaultSetting = RequestSettings{
 	ContentType:       "application/x-www-form-urlencoded",
 	Cookies:           "",
 	Headers:           [][2]string{},
+	TimeTrace:         [8]time.Time{},
+}
+
+// SetIsEnableDNSCache 设置是否启用dns缓存功能
+func SetIsEnableDNSCache(isEnable bool) {
+	packageIsEnableDNSCache = isEnable
 }
 
 // InitSetttings 重新初始化请求设置
@@ -59,12 +103,25 @@ func (settings *RequestSettings) Post(url string, params map[string]string) (str
 	return settings.request("POST", url, params)
 }
 
-func (settings *RequestSettings) request(method string, url string, params map[string]string) (string, *Response, error) {
-	req, err := settings.NewRequest(method, url, params)
+func (settings *RequestSettings) request(method string, reqURL string, params map[string]string) (string, *Response, error) {
+	settings.RawURL = reqURL
+	urlStruct, err := url.Parse(reqURL)
+	if err != nil {
+		return "", nil, err
+	}
+
+	settings.URL = urlStruct
+
+	req, err := settings.NewRequest(method, reqURL, params)
 
 	if err != nil {
 		return "", nil, err
 	}
+
+	// fix a TimeTrace bug when use dnscache
+	settings.TimeTrace[0] = time.Now()
+	settings.TimeTrace[1] = time.Now()
+	settings.TimeTrace[2] = time.Now()
 
 	resp, err := settings.Do(req)
 
@@ -76,6 +133,12 @@ func (settings *RequestSettings) request(method string, url string, params map[s
 
 	if err != nil {
 		return "", nil, err
+	}
+
+	settings.TimeTrace[7] = time.Now()
+	// Skipped DNS
+	if settings.TimeTrace[0].IsZero() {
+		settings.TimeTrace[0] = settings.TimeTrace[1]
 	}
 
 	return content, resp, err
@@ -112,7 +175,53 @@ func (settings *RequestSettings) NewRequest(method string, url string, params ma
 		req.Header.Set("Cookie", settings.Cookies)
 	}
 
+	// Create a httpstat powered context
+	trace := &httptrace.ClientTrace{
+		DNSStart: func(dnsInfo httptrace.DNSStartInfo) {
+			// fmt.Println("DNSStart", time.Now())
+			settings.TimeTrace[0] = time.Now()
+		},
+		DNSDone: func(dnsDoneInfo httptrace.DNSDoneInfo) {
+			// fmt.Println("DNSDone", time.Now())
+			settings.TimeTrace[1] = time.Now()
+		},
+		ConnectStart: func(network, addr string) {
+			// direct connecting to ip
+			// fmt.Println("ConnectStart", time.Now())
+			if settings.TimeTrace[1].IsZero() {
+				settings.TimeTrace[1] = time.Now()
+			}
+		},
+		ConnectDone: func(network, addr string, err error) {
+			// fmt.Println("ConnectDone", time.Now())
+			settings.TimeTrace[2] = time.Now()
+		},
+		GotConn: func(gotConnInfo httptrace.GotConnInfo) {
+			// fmt.Println("GotConn", time.Now())
+			settings.TimeTrace[3] = time.Now()
+		},
+		GotFirstResponseByte: func() {
+			// fmt.Println("GotFirstResponseByte", time.Now())
+			settings.TimeTrace[4] = time.Now()
+		},
+
+		TLSHandshakeStart: func() {
+			// fmt.Println("TLSHandshakeStart", time.Now())
+			settings.TimeTrace[5] = time.Now()
+		},
+		TLSHandshakeDone: func(s tls.ConnectionState, err error) {
+			// fmt.Println("TLSHandshakeDone", time.Now())
+			settings.TimeTrace[6] = time.Now()
+		},
+		GetConn: func(hostPort string) {
+		},
+		PutIdleConn: func(err error) {
+		},
+	}
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+
 	r := Request(*req)
+
 	return &r, err
 }
 
@@ -120,9 +229,35 @@ func (settings *RequestSettings) NewRequest(method string, url string, params ma
 func (settings *RequestSettings) Do(req *Request) (*Response, error) {
 	r := http.Request(*req)
 
-	// 超时设置
-	var c = &http.Client{
-		Timeout: settings.Timeout * time.Second,
+	// dnscache core code
+	var c *http.Client
+	if packageIsEnableDNSCache {
+		resolver := &dnscache.Resolver{}
+		transport := &http.Transport{
+			DialContext: func(ctx context.Context, network string, addr string) (conn net.Conn, err error) {
+				separator := strings.LastIndex(addr, ":")
+				ips, err := resolver.LookupHost(ctx, addr[:separator])
+				if err != nil {
+					return nil, err
+				}
+				for _, ip := range ips {
+					conn, err = net.Dial(network, ip+addr[separator:])
+					if err == nil {
+						break
+					}
+				}
+				return
+			},
+		}
+
+		c = &http.Client{
+			Timeout:   settings.Timeout * time.Second,
+			Transport: transport,
+		}
+	} else {
+		c = &http.Client{
+			Timeout: settings.Timeout * time.Second,
+		}
 	}
 
 	resp, err := c.Do(&r)
@@ -132,7 +267,48 @@ func (settings *RequestSettings) Do(req *Request) (*Response, error) {
 	}
 
 	response := Response(*resp)
+
 	return &response, err
+}
+
+// PrintTimeStrace 打印网络请求各阶段的时间消费
+func (settings *RequestSettings) PrintTimeStrace() {
+	fmta := func(d time.Duration) string {
+		return fmt.Sprintf("%7dms", int(d/time.Millisecond))
+	}
+
+	fmtb := func(d time.Duration) string {
+		return fmt.Sprintf("%-9s", strconv.Itoa(int(d/time.Millisecond))+"ms")
+	}
+
+	switch settings.URL.Scheme {
+	case "https":
+		log.Printf(
+			httpsTemplate,
+			fmta(settings.TimeTrace[1].Sub(settings.TimeTrace[0])), // dns lookup
+			fmta(settings.TimeTrace[2].Sub(settings.TimeTrace[1])), // tcp connection
+			fmta(settings.TimeTrace[6].Sub(settings.TimeTrace[5])), // tls handshake
+			fmta(settings.TimeTrace[4].Sub(settings.TimeTrace[3])), // server processing
+			fmta(settings.TimeTrace[7].Sub(settings.TimeTrace[4])), // content transfer
+			fmtb(settings.TimeTrace[1].Sub(settings.TimeTrace[0])), // namelookup
+			fmtb(settings.TimeTrace[2].Sub(settings.TimeTrace[0])), // connect
+			fmtb(settings.TimeTrace[3].Sub(settings.TimeTrace[0])), // pretransfer
+			fmtb(settings.TimeTrace[4].Sub(settings.TimeTrace[0])), // starttransfer
+			fmtb(settings.TimeTrace[7].Sub(settings.TimeTrace[0])), // total
+		)
+	case "http":
+		log.Printf(
+			httpTemplate,
+			fmta(settings.TimeTrace[1].Sub(settings.TimeTrace[0])), // dns lookup
+			fmta(settings.TimeTrace[3].Sub(settings.TimeTrace[1])), // tcp connection
+			fmta(settings.TimeTrace[4].Sub(settings.TimeTrace[3])), // server processing
+			fmta(settings.TimeTrace[7].Sub(settings.TimeTrace[4])), // content transfer
+			fmtb(settings.TimeTrace[1].Sub(settings.TimeTrace[0])), // namelookup
+			fmtb(settings.TimeTrace[3].Sub(settings.TimeTrace[0])), // connect
+			fmtb(settings.TimeTrace[4].Sub(settings.TimeTrace[0])), // starttransfer
+			fmtb(settings.TimeTrace[7].Sub(settings.TimeTrace[0])), // total
+		)
+	}
 }
 
 // SetCookie 设置 cookie
@@ -218,12 +394,12 @@ func BuildQuery(params map[string]string) string {
 	}
 	result := values.Encode()
 
-	// todo 以下代码针对淘宝秒杀做的限制
+	// todo 还需要优化的代码
 	result = strings.Replace(result, "%27", `'`, -1) // ' 转成 \' 不能转成 %27
 	result = strings.Replace(result, "+", `%20`, -1) // + 转成 %20
 	result = strings.Replace(result, "%28", `(`, -1) // ( 不转成 %28
 	result = strings.Replace(result, "%29", `)`, -1) // ) 不转成 %29
-	// tododel
+	// tododel 还需要优化的代码
 	result = strings.Replace(result, "info%5C%5C%5C%22%3A%5B%5D", `info%5C%5C%5C%22%3A%7B%7D`, -1) // ) 不转成 %29
 
 	return result
