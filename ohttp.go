@@ -55,11 +55,11 @@ func (settings *RequestSettings) Get(url string) (string, *Response, error) {
 }
 
 // Post 执行 Post 请求
-func (settings *RequestSettings) Post(url string, params map[string]string) (string, *Response, error) {
+func (settings *RequestSettings) Post(url string, params interface{}) (string, *Response, error) {
 	return settings.request("POST", url, params)
 }
 
-func (settings *RequestSettings) request(method string, url string, params map[string]string) (string, *Response, error) {
+func (settings *RequestSettings) request(method string, url string, params interface{}) (string, *Response, error) {
 	req, err := settings.NewRequest(method, url, params)
 
 	if err != nil {
@@ -82,8 +82,19 @@ func (settings *RequestSettings) request(method string, url string, params map[s
 }
 
 // NewRequest 创建一个 Request 请求
-func (settings *RequestSettings) NewRequest(method string, url string, params map[string]string) (*Request, error) {
-	req, err := http.NewRequest(method, url, BuildQueryReader(params))
+func (settings *RequestSettings) NewRequest(method string, url string, params interface{}) (*Request, error) {
+	var req *http.Request
+	var err error
+	if _, ok := params.(string); ok {
+		req, err = http.NewRequest(method, url, strings.NewReader(params.(string)))
+	}
+	if _, ok := params.(map[string]string); ok {
+		req, err = http.NewRequest(method, url, BuildQueryReader(params.(map[string]string)))
+	}
+	if nil == params {
+		req, err = http.NewRequest(method, url, nil)
+	}
+
 	if err != nil {
 		return nil, err
 	}
